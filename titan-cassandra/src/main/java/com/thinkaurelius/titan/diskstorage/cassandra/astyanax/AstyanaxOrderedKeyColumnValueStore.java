@@ -1,16 +1,17 @@
 package com.thinkaurelius.titan.diskstorage.cassandra.astyanax;
 
 import com.google.common.collect.ImmutableMap;
+import com.netflix.astyanax.ExceptionCallback;
 import com.netflix.astyanax.Keyspace;
 import com.netflix.astyanax.connectionpool.OperationResult;
 import com.netflix.astyanax.connectionpool.exceptions.ConnectionException;
 import com.netflix.astyanax.connectionpool.exceptions.NotFoundException;
-import com.netflix.astyanax.model.Column;
-import com.netflix.astyanax.model.ColumnFamily;
-import com.netflix.astyanax.model.ColumnList;
+import com.netflix.astyanax.model.*;
+import com.netflix.astyanax.query.AllRowsQuery;
 import com.netflix.astyanax.query.RowQuery;
 import com.netflix.astyanax.retry.RetryPolicy;
 import com.netflix.astyanax.serializers.ByteBufferSerializer;
+import com.thinkaurelius.titan.diskstorage.PermanentStorageException;
 import com.thinkaurelius.titan.diskstorage.StorageException;
 import com.thinkaurelius.titan.diskstorage.TemporaryStorageException;
 import com.thinkaurelius.titan.diskstorage.keycolumnvalue.Entry;
@@ -20,9 +21,7 @@ import com.thinkaurelius.titan.diskstorage.keycolumnvalue.RecordIterator;
 import com.thinkaurelius.titan.diskstorage.keycolumnvalue.StoreTransaction;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import static com.thinkaurelius.titan.diskstorage.cassandra.CassandraTransaction.getTx;
 
@@ -199,7 +198,48 @@ public class AstyanaxOrderedKeyColumnValueStore implements
 
     @Override
     public RecordIterator<ByteBuffer> getKeys(StoreTransaction txh) throws StorageException {
-        throw new UnsupportedOperationException();
+        AllRowsQuery<ByteBuffer, ByteBuffer> allRowsQuery = keyspace.prepareQuery(columnFamily).getAllRows();
+
+        OperationResult<Rows<ByteBuffer, ByteBuffer>> rows;
+        try {
+            rows = allRowsQuery.setRowLimit(100) // pre-fetch 100 rows at a time
+                               .withColumnSlice(Collections.<ByteBuffer>emptyList()) // no columns
+                               .setConcurrencyLevel(1) // one execution thread for fetching portion of rows
+                               .setExceptionCallback(new ExceptionCallback() {
+                                   private int retries = 0;
+
+                                   @Override
+                                   public boolean onException(ConnectionException e) {
+                                       try {
+                                           return retries > 2; // make 3 re-tries
+                                       } finally {
+                                           retries++;
+                                       }
+                                   }
+                               })
+                               .execute();
+        } catch (ConnectionException e) {
+            throw new PermanentStorageException(e);
+        }
+
+        final Iterator<Row<ByteBuffer, ByteBuffer>> iterator = rows.getResult().iterator();
+
+        return new RecordIterator<ByteBuffer>() {
+            @Override
+            public boolean hasNext() throws StorageException {
+                return iterator.hasNext();
+            }
+
+            @Override
+            public ByteBuffer next() throws StorageException {
+                return iterator.next().getKey();
+            }
+
+            @Override
+            public void close() throws StorageException {
+                // nothing to clean-up here
+            }
+        };
     }
 
     @Override

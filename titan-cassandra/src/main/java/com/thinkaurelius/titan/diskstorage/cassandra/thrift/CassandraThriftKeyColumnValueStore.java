@@ -14,27 +14,15 @@ import com.thinkaurelius.titan.diskstorage.keycolumnvalue.Mutation;
 import com.thinkaurelius.titan.diskstorage.keycolumnvalue.RecordIterator;
 import com.thinkaurelius.titan.diskstorage.keycolumnvalue.StoreTransaction;
 import com.thinkaurelius.titan.diskstorage.util.ByteBufferUtil;
-import org.apache.cassandra.thrift.Cassandra;
-import org.apache.cassandra.thrift.Column;
-import org.apache.cassandra.thrift.ColumnOrSuperColumn;
-import org.apache.cassandra.thrift.ColumnParent;
-import org.apache.cassandra.thrift.ColumnPath;
-import org.apache.cassandra.thrift.ConsistencyLevel;
-import org.apache.cassandra.thrift.InvalidRequestException;
-import org.apache.cassandra.thrift.NotFoundException;
-import org.apache.cassandra.thrift.SlicePredicate;
-import org.apache.cassandra.thrift.SliceRange;
-import org.apache.cassandra.thrift.TimedOutException;
-import org.apache.cassandra.thrift.UnavailableException;
+import org.apache.cassandra.dht.*;
+import org.apache.cassandra.thrift.*;
+import org.apache.commons.lang.ArrayUtils;
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import static com.thinkaurelius.titan.diskstorage.cassandra.CassandraTransaction.getTx;
 
@@ -237,7 +225,64 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
 
     @Override
     public RecordIterator<ByteBuffer> getKeys(StoreTransaction txh) throws StorageException {
-        throw new UnsupportedOperationException();
+        CTConnection conn = null;
+
+        final IPartitioner<?> partitioner = storeManager.getCassandraPartitioner();
+
+        if (!(partitioner instanceof RandomPartitioner) && !(partitioner instanceof Murmur3Partitioner))
+            throw new PermanentStorageException("This operation is only allowed when random partitioner (md5 or murmur3) is used.");
+
+        final int pageSize = 10;
+        final Token maximumToken = (partitioner instanceof RandomPartitioner)
+                                    ? new BigIntegerToken(RandomPartitioner.MAXIMUM)
+                                    : new LongToken(Murmur3Partitioner.MAXIMUM);
+        try {
+            conn = pool.genericBorrowObject(keyspace);
+            final Cassandra.Client client = conn.getClient();
+
+            return new RecordIterator<ByteBuffer>() {
+                Iterator<KeySlice> keys = getKeySlice(client,
+                                                      ArrayUtils.EMPTY_BYTE_ARRAY,
+                                                      ArrayUtils.EMPTY_BYTE_ARRAY,
+                                                      pageSize);
+
+                private ByteBuffer lastSeenKey = null;
+
+                @Override
+                public boolean hasNext() throws StorageException {
+                    boolean hasNext = keys.hasNext();
+
+                    if (!hasNext && lastSeenKey != null) {
+                        keys = getKeySlice(client, partitioner.getToken(lastSeenKey), maximumToken, pageSize);
+                        hasNext = keys.hasNext();
+                    }
+
+                    return hasNext;
+                }
+
+                @Override
+                public ByteBuffer next() throws StorageException {
+                    if (!hasNext())
+                        throw new NoSuchElementException();
+
+                    KeySlice slice = keys.next();
+
+                    try {
+                        return slice.bufferForKey().duplicate();
+                    } finally {
+                        lastSeenKey = slice.bufferForKey();
+                    }
+                }
+
+                @Override
+                public void close() throws StorageException {}
+            };
+        } catch (Exception e) {
+            throw convertException(e);
+        } finally {
+            if (conn != null)
+                pool.genericReturnObject(keyspace, conn);
+        }
     }
 
     @Override
@@ -281,4 +326,24 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
                 + keyspace + ", cf=" + columnFamily + "]";
     }
 
+
+    private Iterator<KeySlice> getKeySlice(Cassandra.Client client, byte[] startKey, byte[] endKey, int pageSize) throws StorageException {
+        return getKeySlice(client, new KeyRange().setStart_key(startKey).setEnd_key(endKey).setCount(pageSize));
+    }
+
+    private Iterator<KeySlice> getKeySlice(Cassandra.Client client, Token startToken, Token endToken, int pageSize) throws StorageException {
+        return getKeySlice(client, new KeyRange().setStart_token(startToken.token.toString()).setEnd_token(endToken.token.toString()).setCount(pageSize));
+    }
+
+    private Iterator<KeySlice> getKeySlice(Cassandra.Client client, KeyRange keyRange) throws StorageException {
+        try {
+            return client.get_range_slices(new ColumnParent(columnFamily),
+                                           new SlicePredicate().setColumn_names(Collections.<ByteBuffer>emptyList()),
+                                           keyRange,
+                                           ConsistencyLevel.QUORUM)
+                         .iterator();
+        } catch (Exception e) {
+            throw convertException(e);
+        }
+    }
 }
